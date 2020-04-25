@@ -32,6 +32,7 @@ depends: [
   "metrics"
   "metrics-lwt"
   "metrics-influx"
+  "mtime"
 ]
 pin-depends: [
   ["metrics.dev" "git+https://github.com/hannesm/metrics.git#future"]

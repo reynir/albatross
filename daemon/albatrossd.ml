@@ -15,21 +15,31 @@ let create_lock = Lwt_mutex.create ()
    Vmm_vmmd.handle is getting called, and while communicating via log /
    console / stat socket communication. *)
 
-let rec create stat_out log_out cons_out data_out name config =
+let log_ts tag start =
+  let stop = Mtime_clock.elapsed_ns () in
+  let duration = Mtime.Span.of_uint64_ns (Int64.sub stop start) in
+  Logs.app (fun m -> m "%a after %s" Mtime.Span.pp duration tag)
+
+let rec create start stat_out log_out cons_out data_out name config =
+  log_ts "create" start;
   (match Vmm_vmmd.handle_create !state name config with
    | Error `Msg msg ->
      Logs.err (fun m -> m "failed to create %a: %s" Name.pp name msg) ;
      Lwt.return (None, `Failure msg)
    | Ok (state', (cons, succ_cont, fail_cont)) ->
      state := state';
+     log_ts "handled create" start;
      cons_out "create" cons >>= function
      | Error () -> Lwt.return (None, fail_cont ())
-     | Ok () -> match succ_cont !state with
+     | Ok () ->
+       log_ts "console communication" start;
+       match succ_cont !state with
        | Error (`Msg msg) ->
          Logs.err (fun m -> m "create (exec) failed %s" msg) ;
          Lwt.return (None, fail_cont ())
        | Ok (state', stat, log, data, name, vm) ->
          state := state';
+         log_ts "handled continuation" start;
          (if Unikernel.restart_handler config then
             match Vmm_vmmd.register_restart !state name Lwt.task with
             | None -> ()
@@ -39,13 +49,14 @@ let rec create stat_out log_out cons_out data_out name config =
                   task >>= fun r ->
                   if should_restart config name r then
                     Lwt_mutex.with_lock create_lock (fun () ->
-                        create stat_out log_out cons_out stub_data_out
+                        create start stat_out log_out cons_out stub_data_out
                           name vm.Unikernel.config)
                   else
                     Lwt.return_unit));
          stat_out "setting up stat" stat >>= fun () ->
          log_out "setting up log" log >|= fun () ->
          (Some vm, data)) >>= fun (started, data) ->
+  log_ts "finished starting" start;
   (match started with
    | None -> ()
    | Some vm ->
@@ -61,13 +72,18 @@ let rec create stat_out log_out cons_out data_out name config =
              waiter_opt) >|= function
          | None -> ()
          | Some wakeme -> Lwt.wakeup wakeme r));
-  data_out data
+  log_ts "finished installing waitpid" start;
+  data_out data >|= fun r ->
+  log_ts "finished data out" start;
+  r
 
-let handle log_out cons_out stat_out fd addr =
+let handle start log_out cons_out stat_out fd addr =
   Logs.debug (fun m -> m "connection from %a" Vmm_lwt.pp_sockaddr addr) ;
   let rec loop () =
     Logs.debug (fun m -> m "now reading") ;
-    Vmm_lwt.read_wire fd >>= function
+    Vmm_lwt.read_wire fd >>= fun r ->
+    log_ts "read" start;
+    match r with
     | Error _ ->
       Logs.err (fun m -> m "error while reading") ;
       Lwt.return_unit
@@ -86,7 +102,7 @@ let handle log_out cons_out stat_out fd addr =
         | `Loop wire -> Lwt_mutex.unlock create_lock; out wire >>= loop
         | `End wire -> Lwt_mutex.unlock create_lock; out wire
         | `Create (id, vm) ->
-          create stat_out log_out cons_out out id vm >|= fun () ->
+          create start stat_out log_out cons_out out id vm >|= fun () ->
           Lwt_mutex.unlock create_lock
         | `Wait (who, data) ->
           let state', task = Vmm_vmmd.register !state who Lwt.task in
@@ -101,7 +117,7 @@ let handle log_out cons_out stat_out fd addr =
           task >>= fun r ->
           Logs.info (fun m -> m "wait returned %a" pp_process_exit r);
           Lwt_mutex.with_lock create_lock (fun () ->
-              create stat_out log_out cons_out out id vm)
+              create start stat_out log_out cons_out out id vm)
   in
   loop () >>= fun () ->
   Vmm_lwt.safe_close fd
@@ -180,16 +196,20 @@ let jump _ influx tmpdir dbdir =
 
        Lwt_list.iter_s (fun (name, config) ->
            Lwt_mutex.with_lock create_lock (fun () ->
-               create stat_out log_out cons_out stub_data_out name config))
+               create (Mtime_clock.elapsed_ns ()) stat_out log_out cons_out
+                 stub_data_out name config))
          (Vmm_trie.all old_unikernels) >>= fun () ->
 
        Lwt.catch (fun () ->
            let rec loop () =
              Lwt_unix.accept ss >>= fun (fd, addr) ->
+             let start = Mtime_clock.elapsed_ns () in
+             Logs.app (fun m -> m "accept");
              Lwt_unix.set_close_on_exec fd ;
              m `Open;
              Lwt.async (fun () ->
-                 handle log_out cons_out stat_out fd addr >|= fun () ->
+                 handle start log_out cons_out stat_out fd addr >|= fun () ->
+                 log_ts "done" start;
                  m `Close) ;
              loop ()
            in

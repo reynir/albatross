@@ -251,3 +251,119 @@ CAMLprim value vmmanage_vmmapi_statnames (value name) {
 }
 
 #endif
+
+#ifdef __linux__
+#include <asm/types.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
+#include <sys/socket.h>
+#include <string.h>
+#include <errno.h>
+
+static int vmmanage_rtnetlink_send(int rtnetlink_sock, const char *ifname) {
+  struct {
+    struct nlmsghdr nh;
+    struct ifinfomsg ifi;
+    char attrbuf[512];
+  } req;
+  struct rtattr *rta;
+
+  memset(&req, 0, sizeof(req));
+  req.nh.nlmsg_len = NLMSG_LENGTH(sizeof(struct ifinfomsg));
+  req.nh.nlmsg_flags = NLM_F_REQUEST;
+  req.nh.nlmsg_type = RTM_GETLINK;
+  req.ifi.ifi_family = AF_UNSPEC;
+  rta = (struct rtattr *)((char *) &req + NLMSG_ALIGN(req.nh.nlmsg_len));
+  rta->rta_type = IFLA_IFNAME;
+  rta->rta_len = RTA_LENGTH(strlen(ifname));
+  req.nh.nlmsg_len = NLMSG_ALIGN(req.nh.nlmsg_len) + rta->rta_len;
+  memcpy(RTA_DATA(rta), ifname, strlen(ifname) + 1);
+  int r;
+  r = send(rtnetlink_sock, &req, req.nh.nlmsg_len, 0);
+  return r != req.nh.nlmsg_len;
+}
+
+CAMLprim value vmmanage_rtnetlink_name(value name) {
+  CAMLparam1(name);
+  CAMLlocal1(res);
+  int rtnetlink_sock;
+  int r;
+
+  rtnetlink_sock = socket(AF_NETLINK, SOCK_DGRAM, NETLINK_ROUTE);
+  if (rtnetlink_sock == -1)
+    uerror("socket", Nothing);
+  r = vmmanage_rtnetlink_send(rtnetlink_sock, String_val(name));
+  if (r) {
+    uerror("rtnetlink", Nothing);
+  }
+
+  int len;
+  char buf[8192];
+  struct iovec iov = { buf, sizeof(buf) };
+  struct sockaddr_nl sa;
+  struct nlmsghdr *nh;
+  struct msghdr msg = { &sa, sizeof(sa), &iov, 1, NULL, 0, 0 };
+  len = recvmsg(rtnetlink_sock, &msg, 0);
+
+  struct nlmsgerr *nlmsgerr;
+  struct rtattr *rta;
+  int *mtu = NULL;
+  char *ifname = NULL;
+  struct rtnl_link_stats64 *stats = NULL;
+  struct ifinfomsg *ifi = NULL;
+
+  /* XXX: I think we only ever get one message in response? */
+  for (nh = (struct nlmsghdr *) buf; NLMSG_OK(nh, len); nh = NLMSG_NEXT(nh, len)) {
+    switch (nh->nlmsg_type) {
+      case NLMSG_ERROR:
+        nlmsgerr = NLMSG_DATA(nh);
+        errno = -nlmsgerr->error;
+      case NLMSG_DONE:
+        uerror("rtnetlink", Nothing);
+        break;
+      }
+    if (nh->nlmsg_type == RTM_NEWLINK) {
+      int attr_len;
+      ifi = (struct ifinfomsg *) NLMSG_DATA(nh);
+      rta = IFLA_RTA(ifi);
+      attr_len = IFLA_PAYLOAD(nh);
+      for (; RTA_OK(rta, attr_len); rta = RTA_NEXT(rta, attr_len)) {
+        switch (rta->rta_type) {
+          case IFLA_IFNAME:
+            ifname = RTA_DATA(rta);
+            break;
+          case IFLA_STATS64:
+            stats = RTA_DATA(rta);
+            break;
+          case IFLA_MTU:
+            mtu = RTA_DATA(rta);
+            break;
+        }
+      }
+    }
+  }
+  if (mtu == NULL || ifname == NULL || stats == NULL || ifi == NULL)
+    uerror("rtnetlink", Nothing);
+  res = caml_alloc(18, 0);
+  Store_field(res, 0, caml_copy_string(ifname));
+  Store_field(res, 1, Val32(ifi->ifi_flags));
+  Store_field(res, 2, Val32(0)); /* send_length */
+  Store_field(res, 3, Val32(0)); /* max_send_length */
+  Store_field(res, 4, Val32(0)); /* send_drops */
+  Store_field(res, 5, Val32(*mtu));
+  Store_field(res, 6, Val64(0)); /* baudrate */
+  Store_field(res, 7, Val64(stats->rx_packets));
+  Store_field(res, 8, Val64(stats->rx_errors));
+  Store_field(res, 9, Val64(stats->tx_packets));
+  Store_field(res, 10, Val64(stats->tx_errors));
+  Store_field(res, 11, Val64(stats->collisions));
+  Store_field(res, 12, Val64(stats->rx_bytes));
+  Store_field(res, 13, Val64(stats->tx_bytes));
+  Store_field(res, 14, Val64(stats->multicast)); /* input_mcast */
+  Store_field(res, 15, Val64(0)); /* output_mcast */
+  Store_field(res, 16, Val64(stats->rx_dropped));
+  Store_field(res, 16, Val64(stats->tx_dropped));
+
+  CAMLreturn(res);
+}
+#endif /* Linux */

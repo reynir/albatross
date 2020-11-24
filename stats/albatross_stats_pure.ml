@@ -107,11 +107,21 @@ let string_of_file filename =
     Ok content
   with _ -> Rresult.R.error_msgf "Error reading file %S" filename
 
+let parse_proc_stat s =
+  let pid, tcomm, rest =
+    let tcomm_start = String.index s '('
+    and tcomm_end = String.rindex s ')' in
+    String.sub s 0 (pred tcomm_start),
+    String.sub s (succ tcomm_start) (tcomm_end - tcomm_start - 1),
+    String.sub s (tcomm_end + 2) (String.length s - tcomm_end -2)
+  in
+  pid :: tcom :: Astring.String.cuts ~sep:" " rest
+
 let linux_rusage pid =
   (* reading /proc/<pid>/stat - since it may disappear mid-time,
      best to have it in memory *)
   string_of_file ("/proc/" ^ string_of_int pid ^ "/stat") >>= fun data ->
-  let vals = Astring.String.cuts ~sep:" " data in
+  let vals = parse_proc_stat data in
   let i64 s = try Ok (Int64.of_string s) with
       Failure _ -> Error (`Msg "couldn't parse integer")
   in

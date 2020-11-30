@@ -201,8 +201,7 @@ let solo5_image_target image =
 
 let solo5_tender = function Spt -> "solo5-spt" | Hvt -> "solo5-hvt"
 
-let solo5_image_devices image =
-  check_solo5_cmd "solo5-elftool" >>= fun cmd ->
+let solo5_image_devices cmd image =
   let cmd = Bos.Cmd.(cmd % "query-manifest" % p image) in
   Bos.OS.Cmd.(run_out cmd |> out_string |> success) >>= fun s ->
   R.error_to_msg ~pp_error:Jsonm.pp_error
@@ -222,10 +221,14 @@ let devices_match ~bridges ~block_devices (manifest_block, manifest_net) =
   equal_string_lists manifest_net bridges
     "specified bridge(s) does not match with the manifest"
 
-let manifest_devices_match ~bridges ~block_devices image_file =
-  solo5_image_devices image_file >>=
-  let bridges = List.map fst bridges in
-  devices_match ~bridges ~block_devices
+let manifest_devices_match ?(elftool_required = false) ~bridges ~block_devices image_file =
+  match check_solo5_cmd "solo5-elftool" with
+  | Error _ as e -> if elftool_required then e
+    else (Logs.warn (fun m -> m "unable to check image manifest"); Ok ())
+  | Ok cmd ->
+    solo5_image_devices cmd image_file >>=
+    let bridges = List.map fst bridges in
+    devices_match ~bridges ~block_devices
 
 let bridge_name (service, b) = match b with None -> service | Some b -> b
 
@@ -255,7 +258,7 @@ let prepare name vm =
   Bos.OS.File.write filename (Cstruct.to_string image) >>= fun () ->
   solo5_image_target filename >>= fun target ->
   check_solo5_cmd (solo5_tender target) >>= fun _ ->
-  manifest_devices_match ~bridges:vm.Unikernel.bridges ~block_devices:vm.Unikernel.block_devices filename >>= fun () ->
+  manifest_devices_match ~elftool_required:true ~bridges:vm.Unikernel.bridges ~block_devices:vm.Unikernel.block_devices filename >>= fun () ->
   bridges_exist vm.Unikernel.bridges >>= fun () ->
   let fifo = Name.fifo_file name in
   begin match fifo_exists fifo with
